@@ -1,0 +1,13 @@
+{
+  "name": "chief-of-staff-backend",
+  "version": "1.0.0",
+  "description": "Chief of Staff AI Assistant Backend API",
+  "main": "app.py",
+  "scripts": {
+    "start": "python app.py",
+    "dev": "uvicorn app:app --reload --port 8000"
+  },
+  "keywords": ["ai", "assistant", "calendar", "briefing"],
+  "author": "Your Name",
+  "license": "MIT"
+}
