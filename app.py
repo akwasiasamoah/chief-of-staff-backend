@@ -33,7 +33,7 @@ from google import genai
 
 # SendGrid for email notifications
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+from sendgrid.helpers.mail import Mail, From, ReplyTo, Content, Category
 
 # Load environment
 load_dotenv()
@@ -91,8 +91,8 @@ class User(Base):
     token_expiry = Column(DateTime, nullable=True)
     morning_brief_time = Column(String, default="08:00")
     notifications_enabled = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     
     briefs = relationship("Brief", back_populates="user", cascade="all, delete-orphan")
 
@@ -108,7 +108,7 @@ class Brief(Base):
     meeting_time = Column(DateTime, nullable=True)
     meeting_id = Column(String, nullable=True, index=True)  # Google Calendar event ID
     attendee_email = Column(String, nullable=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     read = Column(Boolean, default=False)
     
     user = relationship("User", back_populates="briefs")
@@ -538,13 +538,33 @@ async def send_brief_email(user: User, brief):
         </html>
         '''
         
-        # Create message
+        # Create message with proper headers
         message = Mail(
-            from_email=sender_email,
+            from_email=From(sender_email, "Chief of Staff"),  # Add friendly name
             to_emails=user.email,
-            subject=f"{brief_type_emoji} {brief.title}",
-            html_content=html_content
+            subject=f"{brief_type_emoji} {brief.title}"
         )
+        
+        # Set HTML content
+        message.content = Content("text/html", html_content)
+        
+        # Add plain text version (helps deliverability)
+        plain_text = f"""
+{brief.title}
+
+{brief.content}
+
+---
+You're receiving this because you have notifications enabled in Chief of Staff.
+Manage your settings: {os.getenv('FRONTEND_URL', 'http://localhost:5500')}
+        """
+        message.add_content(Content("text/plain", plain_text))
+        
+        # Add anti-spam headers
+        message.reply_to = ReplyTo(sender_email, "Chief of Staff")
+        
+        # Add categories for SendGrid tracking
+        message.add_category(Category(f"brief-{brief.brief_type}"))
         
         # Send email
         sg = SendGridAPIClient(sendgrid_api_key)
