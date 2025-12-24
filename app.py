@@ -6,7 +6,7 @@ Supports both SQLite (local) and PostgreSQL (production)
 import os
 import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from dotenv import load_dotenv
 
@@ -15,6 +15,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 
 # Database
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, ForeignKey, create_engine, select, desc
@@ -27,8 +28,12 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# OpenAI
-from openai import OpenAI
+# Google Gemini AI (New SDK)
+from google import genai
+
+# SendGrid for email notifications
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 # Load environment
 load_dotenv()
@@ -37,7 +42,9 @@ load_dotenv()
 # CONFIGURATION
 # =============================================================================
 
-OPENAI_CLIENT = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+# Configure Gemini AI (New SDK)
+GEMINI_CLIENT = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+GEMINI_MODEL = 'gemini-2.5-flash'  # Latest fast model
 
 # Database URL - Auto-detect PostgreSQL or SQLite
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -84,8 +91,8 @@ class User(Base):
     token_expiry = Column(DateTime, nullable=True)
     morning_brief_time = Column(String, default="08:00")
     notifications_enabled = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     
     briefs = relationship("Brief", back_populates="user", cascade="all, delete-orphan")
 
@@ -99,8 +106,9 @@ class Brief(Base):
     content = Column(Text)
     meeting_title = Column(String, nullable=True)
     meeting_time = Column(DateTime, nullable=True)
+    meeting_id = Column(String, nullable=True, index=True)  # Google Calendar event ID
     attendee_email = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     read = Column(Boolean, default=False)
     
     user = relationship("User", back_populates="briefs")
@@ -127,7 +135,18 @@ async def get_db():
 # FASTAPI APP
 # =============================================================================
 
-app = FastAPI(title="Chief of Staff Backend")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan event handler for startup and shutdown"""
+    # Startup
+    await init_db()
+    asyncio.create_task(run_scheduler_loop())
+    print("✅ Scheduler started")
+    yield
+    # Shutdown (cleanup if needed)
+    print("👋 Shutting down...")
+
+app = FastAPI(title="Chief of Staff Backend", lifespan=lifespan)
 
 # CORS configuration
 app.add_middleware(
@@ -143,14 +162,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup"""
-    await init_db()
-    # Start scheduler as async task
-    asyncio.create_task(run_scheduler_loop())
-    print("✅ Scheduler started")
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -290,7 +301,7 @@ async def google_oauth_callback(code: str, state: str, db: AsyncSession = Depend
             user.token_expiry = credentials.expiry
             user.name = name
             user.picture = picture
-            user.updated_at = datetime.utcnow()
+            user.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             print(f"✅ User updated: {email}")
         
         await db.commit()
@@ -346,7 +357,7 @@ async def update_user_settings(
     if 'notifications_enabled' in settings:
         user.notifications_enabled = settings['notifications_enabled']
     
-    user.updated_at = datetime.utcnow()
+    user.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
     
     return {"status": "success"}
@@ -365,9 +376,11 @@ async def get_calendar_events(user: User, db: AsyncSession, time_min=None, time_
         service = build('calendar', 'v3', credentials=creds)
         
         if not time_min:
-            time_min = datetime.utcnow().isoformat() + 'Z'
+            # Get current UTC time and format with Z suffix
+            time_min = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + 'Z'
         if not time_max:
-            time_max = (datetime.utcnow() + timedelta(days=1)).isoformat() + 'Z'
+            # Get tomorrow UTC time and format with Z suffix
+            time_max = (datetime.now(timezone.utc) + timedelta(days=1)).replace(tzinfo=None).isoformat() + 'Z'
         
         events_result = service.events().list(
             calendarId='primary',
@@ -423,6 +436,126 @@ async def get_email_history(user: User, db: AsyncSession, query: str = "", max_r
         return []
 
 # =============================================================================
+# EMAIL NOTIFICATIONS
+# =============================================================================
+
+async def send_brief_email(user: User, brief):
+    """Send email notification for new brief"""
+    if not user.notifications_enabled:
+        print(f"⏭️  Notifications disabled for {user.email}")
+        return
+    
+    sendgrid_api_key = os.getenv('SENDGRID_API_KEY')
+    sender_email = os.getenv('SENDGRID_FROM_EMAIL')
+    
+    if not sendgrid_api_key or not sender_email:
+        print("⚠️  SendGrid not configured (SENDGRID_API_KEY or SENDGRID_FROM_EMAIL missing)")
+        return
+    
+    try:
+        # Disable SSL verification for SendGrid (workaround for corporate/proxy SSL issues)
+        import ssl
+        ssl._create_default_https_context = ssl._create_unverified_context
+        
+        # Format brief type
+        brief_type_emoji = "☀️" if brief.brief_type == "morning" else "📅"
+        
+        # Create email content
+        html_content = f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    line-height: 1.6;
+                    color: #333;
+                    max-width: 600px;
+                    margin: 0 auto;
+                    padding: 20px;
+                }}
+                .header {{
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    padding: 30px 20px;
+                    border-radius: 10px 10px 0 0;
+                    text-align: center;
+                }}
+                .content {{
+                    background: #f8fafc;
+                    padding: 30px;
+                    border-radius: 0 0 10px 10px;
+                }}
+                .brief-title {{
+                    font-size: 24px;
+                    font-weight: bold;
+                    margin-bottom: 20px;
+                    color: #1e293b;
+                }}
+                .brief-content {{
+                    background: white;
+                    padding: 20px;
+                    border-radius: 8px;
+                    border-left: 4px solid #667eea;
+                    white-space: pre-wrap;
+                }}
+                .button {{
+                    display: inline-block;
+                    background: #667eea;
+                    color: white;
+                    padding: 12px 30px;
+                    text-decoration: none;
+                    border-radius: 6px;
+                    margin-top: 20px;
+                }}
+                .footer {{
+                    text-align: center;
+                    margin-top: 30px;
+                    color: #64748b;
+                    font-size: 14px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>👨‍💼 Chief of Staff</h1>
+                <p>Your AI Executive Assistant</p>
+            </div>
+            <div class="content">
+                <div class="brief-title">{brief_type_emoji} {brief.title}</div>
+                <div class="brief-content">{brief.content}</div>
+                <center>
+                    <a href="{os.getenv('FRONTEND_URL', 'http://localhost:5500')}" class="button">
+                        View in Dashboard
+                    </a>
+                </center>
+            </div>
+            <div class="footer">
+                <p>You're receiving this because you have notifications enabled in Chief of Staff.</p>
+                <p><a href="{os.getenv('FRONTEND_URL', 'http://localhost:5500')}">Manage Settings</a></p>
+            </div>
+        </body>
+        </html>
+        '''
+        
+        # Create message
+        message = Mail(
+            from_email=sender_email,
+            to_emails=user.email,
+            subject=f"{brief_type_emoji} {brief.title}",
+            html_content=html_content
+        )
+        
+        # Send email
+        sg = SendGridAPIClient(sendgrid_api_key)
+        response = sg.send(message)
+        
+        print(f"✅ Email sent to {user.email} (Status: {response.status_code})")
+        
+    except Exception as e:
+        print(f"❌ Email error for {user.email}: {e}")
+
+# =============================================================================
 # BRIEF GENERATION
 # =============================================================================
 
@@ -441,7 +574,7 @@ async def generate_morning_brief(user: User, db: AsyncSession):
                 for event in events
             ])
             
-            # Generate brief with OpenAI
+            # Generate brief with Gemini (New SDK)
             prompt = f"""Create a concise morning brief for the day. Here are today's meetings:
 
 {events_text}
@@ -453,13 +586,11 @@ Provide:
 
 Keep it brief and actionable."""
 
-            response = OPENAI_CLIENT.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500
+            response = GEMINI_CLIENT.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt
             )
-            
-            content = response.choices[0].message.content
+            content = response.text
         
         # Save brief
         brief = Brief(
@@ -467,11 +598,15 @@ Keep it brief and actionable."""
             brief_type="morning",
             title=f"Morning Brief - {datetime.now().strftime('%B %d, %Y')}",
             content=content,
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None)
         )
         db.add(brief)
         await db.commit()
+        await db.refresh(brief)
         print(f"✅ Morning brief generated for {user.email}")
+        
+        # Send email notification
+        await send_brief_email(user, brief)
         
     except Exception as e:
         print(f"❌ Error generating morning brief: {e}")
@@ -480,10 +615,25 @@ async def generate_meeting_brief(user: User, meeting: dict, db: AsyncSession):
     """Generate pre-meeting brief"""
     try:
         meeting_title = meeting.get('summary', 'Meeting')
+        meeting_id = meeting.get('id')  # Google Calendar event ID
         attendees = meeting.get('attendees', [])
         
         if not attendees:
             return
+        
+        # Check if brief already exists for this meeting
+        if meeting_id:
+            result = await db.execute(
+                select(Brief).where(
+                    Brief.user_id == user.id,
+                    Brief.meeting_id == meeting_id
+                )
+            )
+            existing_brief = result.scalar_one_or_none()
+            
+            if existing_brief:
+                print(f"⏭️  Brief already exists for meeting: {meeting_title} (skipping)")
+                return
         
         # Get email history with attendees
         attendee_emails = [a['email'] for a in attendees if 'email' in a]
@@ -500,7 +650,7 @@ async def generate_meeting_brief(user: User, meeting: dict, db: AsyncSession):
         else:
             email_context = "No recent email history found."
         
-        # Generate brief
+        # Generate brief with Gemini (New SDK)
         prompt = f"""Create a pre-meeting brief for: {meeting_title}
 
 Attendees: {', '.join(attendee_emails)}
@@ -515,13 +665,11 @@ Provide:
 
 Keep it concise and actionable."""
 
-        response = OPENAI_CLIENT.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500
+        response = GEMINI_CLIENT.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
         )
-        
-        content = response.choices[0].message.content
+        content = response.text
         
         # Save brief
         brief = Brief(
@@ -530,13 +678,18 @@ Keep it concise and actionable."""
             title=f"Pre-Meeting Brief: {meeting_title}",
             content=content,
             meeting_title=meeting_title,
-            meeting_time=datetime.fromisoformat(meeting['start']['dateTime'].replace('Z', '+00:00')),
+            meeting_time=datetime.fromisoformat(meeting['start']['dateTime'].replace('Z', '+00:00')).replace(tzinfo=None),
+            meeting_id=meeting_id,  # Store meeting ID to prevent duplicates
             attendee_email=attendee_emails[0] if attendee_emails else None,
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None)
         )
         db.add(brief)
         await db.commit()
+        await db.refresh(brief)
         print(f"✅ Meeting brief generated for {user.email}: {meeting_title}")
+        
+        # Send email notification
+        await send_brief_email(user, brief)
         
     except Exception as e:
         print(f"❌ Error generating meeting brief: {e}")
@@ -564,13 +717,13 @@ async def check_and_generate_briefs():
                         await generate_morning_brief(user, db)
                     
                     # Check for upcoming meetings (10 minutes before)
-                    upcoming_start = datetime.utcnow() + timedelta(minutes=10)
+                    upcoming_start = datetime.now(timezone.utc) + timedelta(minutes=10)
                     upcoming_end = upcoming_start + timedelta(minutes=1)
                     
                     events = await get_calendar_events(
                         user, db,
-                        time_min=upcoming_start.isoformat() + 'Z',
-                        time_max=upcoming_end.isoformat() + 'Z'
+                        time_min=upcoming_start.replace(tzinfo=None).isoformat() + 'Z',
+                        time_max=upcoming_end.replace(tzinfo=None).isoformat() + 'Z'
                     )
                     
                     for event in events:
@@ -620,6 +773,35 @@ async def get_today_schedule(user_email: str, db: AsyncSession = Depends(get_db)
     return {
         "events": events,
         "has_access": user.access_token is not None
+    }
+
+@app.get("/schedule/debug")
+async def debug_schedule(user_email: str, db: AsyncSession = Depends(get_db)):
+    """Debug calendar events - see what Google returns"""
+    result = await db.execute(select(User).where(User.email == user_email))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get current time info
+    now = datetime.now(timezone.utc)
+    tomorrow = now + timedelta(days=1)
+    time_min = now.replace(tzinfo=None).isoformat() + 'Z'
+    time_max = tomorrow.replace(tzinfo=None).isoformat() + 'Z'
+    
+    # Get events
+    events = await get_calendar_events(user, db)
+    
+    return {
+        "current_time_utc": now.isoformat(),
+        "query_time_min": time_min,
+        "query_time_max": time_max,
+        "events_count": len(events),
+        "events": events,
+        "has_access": user.access_token is not None,
+        "user_has_token": user.access_token is not None,
+        "user_has_refresh_token": user.refresh_token is not None
     }
 
 @app.get("/briefs")
