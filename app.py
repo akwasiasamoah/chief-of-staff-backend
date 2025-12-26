@@ -692,13 +692,21 @@ Keep it concise and actionable."""
         content = response.text
         
         # Save brief
+        # Handle both dateTime (specific time) and date (all-day) events
+        meeting_time = None
+        if 'dateTime' in meeting['start']:
+            meeting_time = datetime.fromisoformat(meeting['start']['dateTime'].replace('Z', '+00:00')).replace(tzinfo=None)
+        elif 'date' in meeting['start']:
+            # All-day event - use date at midnight
+            meeting_time = datetime.strptime(meeting['start']['date'], '%Y-%m-%d')
+        
         brief = Brief(
             user_id=user.id,
             brief_type="meeting",
             title=f"Pre-Meeting Brief: {meeting_title}",
             content=content,
             meeting_title=meeting_title,
-            meeting_time=datetime.fromisoformat(meeting['start']['dateTime'].replace('Z', '+00:00')).replace(tzinfo=None),
+            meeting_time=meeting_time,
             meeting_id=meeting_id,  # Store meeting ID to prevent duplicates
             attendee_email=attendee_emails[0] if attendee_emails else None,
             created_at=datetime.now(timezone.utc).replace(tzinfo=None)
