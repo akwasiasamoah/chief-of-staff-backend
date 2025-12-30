@@ -779,13 +779,20 @@ async def run_scheduler_loop():
 # =============================================================================
 
 @app.get("/")
+@app.head("/")
 async def root():
-    """Health check"""
+    """Root endpoint"""
     return {
         "status": "ok",
         "app": "Chief of Staff Backend",
-        "database": "PostgreSQL" if "postgresql" in DATABASE_URL else "SQLite"
+        "version": "1.0.0"
     }
+
+@app.get("/health")
+@app.head("/health")
+async def health_check():
+    """Health check endpoint for monitoring services"""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/schedule/today")
 async def get_today_schedule(user_email: str, db: AsyncSession = Depends(get_db)):
